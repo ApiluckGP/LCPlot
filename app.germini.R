@@ -6,10 +6,11 @@ library(shiny)
 library(readr)  # For reading CSV and TSV
 library(readxl) # For reading XLSX
 library(dplyr)  # For data manipulation
+library(tidyr)  # For separating rows
 
 # Define the user interface (UI) with a navigation menu and sidebar layout
 ui <- navbarPage(
-  title = "File Uploader App",
+  title = "qPCR Data Analyzer",
   
   # The first tab, dedicated to file uploading and data preview
   tabPanel("Load Input",
@@ -35,8 +36,8 @@ ui <- navbarPage(
              
              # Main panel for displaying the uploaded data
              mainPanel(
-               h4("Preview of Uploaded Data"),
-               p("The content of the most recently uploaded file will be displayed here."),
+               h4("Preview of Processed Data"),
+               p("The organized and calculated data will be displayed here."),
                dataTableOutput("contents")
              )
            )
@@ -61,14 +62,44 @@ server <- function(input, output, session) {
     file_type <- input$file_type
     
     # Read the file based on the selected type
-    data <- switch(file_type,
-                   "csv" = read_csv(input$data_file$datapath),
-                   "xlsx" = read_excel(input$data_file$datapath),
-                   "tsv" = read_tsv(input$data_file$datapath)
+    df <- switch(file_type,
+                 "csv" = read_csv(input$data_file$datapath),
+                 "xlsx" = read_excel(input$data_file$datapath),
+                 "tsv" = read_tsv(input$data_file$datapath)
     )
     
-    # Store the data in the reactive value
-    uploaded_data_rv(data)
+    # --- Data Processing and Calculation ---
+    
+    # 1. Organize data to different line for hex and fam of same SAMPLE ID or WELL position.
+    processed_data <- df %>%
+      select(`DYE NAME`, `SAMPLE ID`, `WELL POSITION`, X, Y) %>%
+      pivot_longer(cols = c(X, Y), names_to = "measurement", values_to = "value") %>%
+      separate_rows(value, sep = "\\|", convert = TRUE) %>%
+      group_by(`DYE NAME`, `SAMPLE ID`, `WELL POSITION`) %>%
+      mutate(Cycle = 1:n()) %>%
+      pivot_wider(names_from = "measurement", values_from = "value")
+    
+    # 2. Calculate baseline fluorescence of FAM and HEX based on first 7 cycles
+    baseline_data <- processed_data %>%
+      filter(Cycle <= 7) %>%
+      group_by(`DYE NAME`, `SAMPLE ID`, `WELL POSITION`) %>%
+      summarise(Baseline = mean(Y, na.rm = TRUE), .groups = 'drop')
+    
+    # 3. Calculate ΔRn (FAM) and ΔRn (HEX)
+    final_data <- processed_data %>%
+      left_join(baseline_data, by = c("DYE NAME", "SAMPLE ID", "WELL POSITION")) %>%
+      mutate(delta_Rn = Y - Baseline) %>%
+      # Pivot wider to get separate columns for FAM and HEX delta_Rn
+      pivot_wider(id_cols = c(`SAMPLE ID`, `WELL POSITION`, Cycle),
+                  names_from = `DYE NAME`,
+                  values_from = delta_Rn,
+                  names_prefix = "Delta_Rn_") %>%
+      rename("ΔRn (FAM)" = Delta_Rn_FAM, "ΔRn (HEX)" = Delta_Rn_HEX) %>%
+      select(`SAMPLE ID`, `WELL POSITION`, `ΔRn (FAM)`, `ΔRn (HEX)`) %>%
+      distinct() # Ensure unique rows
+    
+    # Store the processed data in the reactive value
+    uploaded_data_rv(final_data)
   })
   
   # Output the contents of the uploaded file to a table
