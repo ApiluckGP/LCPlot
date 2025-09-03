@@ -6,11 +6,11 @@ library(shiny)
 library(readr)  # For reading CSV and TSV
 library(readxl) # For reading XLSX
 library(dplyr)  # For data manipulation
-library(tidyr)  # For separating rows
+library(tidyr)  # For data transformation
 
 # Define the user interface (UI) with a navigation menu and sidebar layout
 ui <- navbarPage(
-  title = "qPCR Data Analyzer",
+  title = "File Uploader App",
   
   # The first tab, dedicated to file uploading and data preview
   tabPanel("Load Input",
@@ -36,8 +36,8 @@ ui <- navbarPage(
              
              # Main panel for displaying the uploaded data
              mainPanel(
-               h4("Preview of Processed Data"),
-               p("The organized and calculated data will be displayed here."),
+               h4("Preview of Uploaded Data"),
+               p("The content of the most recently uploaded file will be displayed here."),
                dataTableOutput("contents")
              )
            )
@@ -53,7 +53,7 @@ ui <- navbarPage(
 server <- function(input, output, session) {
   
   # A reactive value to hold the most recently uploaded data
-  uploaded_data_rv <- reactiveVal(NULL)
+  processed_data_rv <- reactiveVal(NULL)
   
   # Observer for the "Load Data" button to read and process the file
   observeEvent(input$load_data, {
@@ -62,50 +62,55 @@ server <- function(input, output, session) {
     file_type <- input$file_type
     
     # Read the file based on the selected type
-    df <- switch(file_type,
-                 "csv" = read_csv(input$data_file$datapath),
-                 "xlsx" = read_excel(input$data_file$datapath),
-                 "tsv" = read_tsv(input$data_file$datapath)
+    data <- switch(file_type,
+                   "csv" = read_csv(input$data_file$datapath),
+                   "xlsx" = read_excel(input$data_file$datapath),
+                   "tsv" = read_tsv(input$data_file$datapath)
     )
     
-    # --- Data Processing and Calculation ---
-    
-    # 1. Organize data to different line for hex and fam of same SAMPLE ID or WELL position.
-    processed_data <- df %>%
-      select(`DYE NAME`, `SAMPLE ID`, `WELL POSITION`, X, Y) %>%
-      pivot_longer(cols = c(X, Y), names_to = "measurement", values_to = "value") %>%
-      separate_rows(value, sep = "\\|", convert = TRUE) %>%
-      group_by(`DYE NAME`, `SAMPLE ID`, `WELL POSITION`) %>%
-      mutate(Cycle = 1:n()) %>%
-      pivot_wider(names_from = "measurement", values_from = "value")
-    
-    # 2. Calculate baseline fluorescence of FAM and HEX based on first 7 cycles
-    baseline_data <- processed_data %>%
-      filter(Cycle <= 7) %>%
-      group_by(`DYE NAME`, `SAMPLE ID`, `WELL POSITION`) %>%
-      summarise(Baseline = mean(Y, na.rm = TRUE), .groups = 'drop')
-    
-    # 3. Calculate ΔRn (FAM) and ΔRn (HEX)
-    final_data <- processed_data %>%
-      left_join(baseline_data, by = c("DYE NAME", "SAMPLE ID", "WELL POSITION")) %>%
-      mutate(delta_Rn = Y - Baseline) %>%
-      # Pivot wider to get separate columns for FAM and HEX delta_Rn
-      pivot_wider(id_cols = c(`SAMPLE ID`, `WELL POSITION`, Cycle),
-                  names_from = `DYE NAME`,
-                  values_from = delta_Rn,
-                  names_prefix = "Delta_Rn_") %>%
-      rename("ΔRn (FAM)" = Delta_Rn_FAM, "ΔRn (HEX)" = Delta_Rn_HEX) %>%
-      select(`SAMPLE ID`, `WELL POSITION`, `ΔRn (FAM)`, `ΔRn (HEX)`) %>%
-      distinct() # Ensure unique rows
+    # --- Data Processing and Calculation Pipeline ---
+    processed_data <- data %>%
+      # Organize data to have one row per cycle and dye
+      pivot_longer(cols = c(X, Y), names_to = "Measurement", values_to = "Value") %>%
+      separate_rows(Value, sep = "\\|", convert = TRUE) %>%
+      select(-Measurement) %>% # We don't need this column anymore
+      # Add a cycle number
+      group_by(`SAMPLE ID`, `WELL POSITION`, `DYE NAME`) %>%
+      mutate(Cycle = row_number()) %>%
+      ungroup() %>%
+      # Calculate the baseline for each sample (mean of the first 7 cycles)
+      group_by(`SAMPLE ID`, `WELL POSITION`, `DYE NAME`) %>%
+      mutate(Baseline = mean(Value[Cycle <= 7], na.rm = TRUE)) %>%
+      ungroup() %>%
+      # Calculate Delta Rn (ΔRn)
+      mutate(delta_Rn = Value - Baseline) %>%
+      # Get the mean ΔRn for each sample and dye
+      group_by(`SAMPLE ID`, `WELL POSITION`, `DYE NAME`) %>%
+      summarise(Mean_Delta_Rn = mean(delta_Rn, na.rm = TRUE), .groups = 'drop') %>%
+      # Pivot wider to get separate columns for FAM and HEX ΔRn
+      pivot_wider(
+        names_from = `DYE NAME`,
+        values_from = Mean_Delta_Rn
+      ) %>%
+      # Rename the new columns to the desired format
+      rename(`ΔRn (FAM)` = FAM, `ΔRn (HEX)` = HEX) %>%
+      # Round the values in the ΔRn columns to 5 decimal places
+      mutate(`ΔRn (FAM)` = round(`ΔRn (FAM)`, 5),
+             `ΔRn (HEX)` = round(`ΔRn (HEX)`, 5)) %>%
+      # Select and order the columns for the preview table
+      select(`WELL POSITION`, `SAMPLE ID`, `ΔRn (FAM)`, `ΔRn (HEX)`)
     
     # Store the processed data in the reactive value
-    uploaded_data_rv(final_data)
+    processed_data_rv(processed_data)
   })
   
   # Output the contents of the uploaded file to a table
   output$contents <- renderDataTable({
-    uploaded_data_rv()
-  })
+    processed_data_rv()
+  }, options = list(
+    rownames = FALSE,
+    columnDefs = list(list(className = 'dt-center', targets = '_all'))
+  ))
   
 }
 
